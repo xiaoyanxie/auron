@@ -15,6 +15,7 @@
 # limitations under the License.
 #
 
+# Register this inherited workflow for manual dispatch in the fork.
 name: TPC-DS
 
 on:
