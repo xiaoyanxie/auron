@@ -27,7 +27,7 @@ import org.apache.iceberg.expressions.{And => IcebergAnd, BoundPredicate, Expres
 import org.apache.iceberg.spark.source.AuronIcebergSourceUtil
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.auron.{NativeConverters, Shims}
-import org.apache.spark.sql.catalyst.expressions.{And => SparkAnd, AttributeReference, EqualTo, Expression => SparkExpression, GreaterThan, GreaterThanOrEqual, In, IsNaN, IsNotNull, IsNull, LessThan, LessThanOrEqual, Literal, Not => SparkNot, Or => SparkOr}
+import org.apache.spark.sql.catalyst.expressions.{And => SparkAnd, AttributeReference, EqualTo, Expression => SparkExpression, GreaterThan, GreaterThanOrEqual, In, IsNaN, IsNotNull, IsNull, LessThan, LessThanOrEqual, Literal, Not => SparkNot, Or => SparkOr, StartsWith}
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.connector.read.{InputPartition, Scan}
 import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
@@ -83,7 +83,14 @@ object IcebergScanSupport extends Logging {
     if (collectUnsupportedMetadataColumns(scan.readSchema, isChangelogScan).nonEmpty) {
       Some("Has per-row materialization (for example _pos).")
     } else {
-      None
+      val unsupportedFields = collectUnsupportedDataTypeFields(scan.readSchema, isChangelogScan)
+      if (unsupportedFields.nonEmpty) {
+        Some(
+          s"Unsupported Iceberg scan schema. Unsupported fields/types: " +
+            s"${unsupportedFields.mkString(", ")}.")
+      } else {
+        None
+      }
     }
   }
 
@@ -376,6 +383,16 @@ object IcebergScanSupport extends Logging {
             !isSupportedMetadataColumn(field, isChangelogScan) =>
         field.name
     }
+
+  private def collectUnsupportedDataTypeFields(
+      schema: StructType,
+      isChangelogScan: Boolean): Seq[String] =
+    schema.fields
+      .filterNot(field =>
+        isIcebergMetadataColumn(field.name, isChangelogScan) &&
+          !isSupportedMetadataColumn(field, isChangelogScan))
+      .filterNot(field => NativeConverters.isTypeSupported(field.dataType))
+      .map(field => s"${field.name}: ${field.dataType.catalogString}")
 
   private def isIcebergMetadataColumn(name: String, isChangelogScan: Boolean): Boolean =
     MetadataColumns.isMetadataColumn(name) ||
@@ -752,6 +769,15 @@ object IcebergScanSupport extends Logging {
       dataType: DataType,
       op: org.apache.iceberg.expressions.Expression.Operation,
       literalValue: Any): Option[SparkExpression] = {
+    if (op == org.apache.iceberg.expressions.Expression.Operation.STARTS_WITH) {
+      if (dataType == StringType) {
+        return toLiteral(literalValue, StringType)
+          .filter(_.value != null)
+          .map(StartsWith(attr, _))
+      }
+      return None
+    }
+
     if (!supportsScanPruningLiteralType(dataType)) {
       return None
     }
