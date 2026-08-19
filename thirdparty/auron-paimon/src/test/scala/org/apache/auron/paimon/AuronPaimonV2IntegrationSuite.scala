@@ -143,6 +143,26 @@ class AuronPaimonV2IntegrationSuite
     }
   }
 
+  test("paimon v2 native scan preserves latest COW value after compaction") {
+    withTable("paimon.db.t_cow_multi_commit") {
+      sql("""
+            |create table paimon.db.t_cow_multi_commit (id int, v string)
+            |using paimon
+            |tblproperties (
+            |  'primary-key' = 'id',
+            |  'bucket' = '2',
+            |  'full-compaction.delta-commits' = '1'
+            |)
+            |""".stripMargin)
+      sql("insert into paimon.db.t_cow_multi_commit values (1, 'a'), (2, 'b')")
+      sql("insert into paimon.db.t_cow_multi_commit values (1, 'updated')")
+      sql("CALL paimon.sys.compact(table => 'db.t_cow_multi_commit')")
+      val df = sql("select * from paimon.db.t_cow_multi_commit")
+      checkAnswer(df, Seq(Row(1, "updated"), Row(2, "b")))
+      assertNativePaimonScanApplied(df)
+    }
+  }
+
   test("paimon v2 native scan handles empty table") {
     withTable("paimon.db.t_empty") {
       sql("create table paimon.db.t_empty (id int, v string) using paimon")
@@ -401,6 +421,21 @@ class AuronPaimonV2IntegrationSuite
 
       assert(!plan.contains("NativePaimonV2TableScan"))
       assert(df.collect().length === 1)
+    }
+  }
+
+  test("paimon v2 native scan falls back for unsupported data types") {
+    withTable("paimon.db.t_unsupported_type") {
+      sql(
+        "create table paimon.db.t_unsupported_type (id int, amount decimal(38, 10)) using paimon")
+      sql(
+        "insert into paimon.db.t_unsupported_type values " +
+          "(1, cast(123.45 as decimal(38, 10)))")
+
+      val df = sql("select * from paimon.db.t_unsupported_type")
+      checkAnswer(df, Seq(Row(1, new java.math.BigDecimal("123.4500000000"))))
+      val plan = df.queryExecution.executedPlan.toString()
+      assert(!plan.contains("NativePaimonV2TableScan"))
     }
   }
 

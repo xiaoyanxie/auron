@@ -17,6 +17,7 @@
 package org.apache.auron
 
 import org.apache.spark.sql.{AuronQueryTest, Row}
+import org.apache.spark.sql.auron.join.JoinBuildSides.{JoinBuildLeft, JoinBuildRight}
 import org.apache.spark.sql.execution.auron.plan.NativeFilterBase
 import org.apache.spark.sql.execution.auron.plan.NativeShuffledHashJoinBase
 import org.apache.spark.sql.execution.auron.plan.NativeSortMergeJoinBase
@@ -883,6 +884,90 @@ class AuronQuerySuite extends AuronQueryTest with BaseAuronSQLSuite with AuronSQ
     }
   }
 
+  test("native broadcast hash join supports inner residual condition") {
+    withSQLConf("spark.sql.adaptive.enabled" -> "false") {
+      withTable("bhj_left", "bhj_right") {
+        sql("""
+              |CREATE TABLE bhj_left USING parquet AS
+              |SELECT * FROM VALUES
+              |  (1, 1),
+              |  (1, 5),
+              |  (2, null),
+              |  (3, 7)
+              |AS t(id, lv)
+              |""".stripMargin)
+
+        sql("""
+              |CREATE TABLE bhj_right USING parquet AS
+              |SELECT * FROM VALUES
+              |  (1, 2),
+              |  (1, 4),
+              |  (2, 3),
+              |  (3, 8)
+              |AS t(id, rv)
+              |""".stripMargin)
+
+        Seq(("BROADCAST(r)", JoinBuildRight), ("BROADCAST(l)", JoinBuildLeft)).foreach {
+          case (hint, expectedBuildSide) =>
+            val df = checkSparkAnswerAndOperator(s"""
+               |SELECT /*+ $hint */ l.id
+               |FROM bhj_left l
+               |JOIN bhj_right r
+               |  ON l.id = r.id AND l.lv < r.rv
+               |ORDER BY l.id
+               |""".stripMargin)
+
+            val plan = stripAQEPlan(df.queryExecution.executedPlan)
+            val nativeBhj = plan
+              .collectFirst { case join: NativeBroadcastJoinExec => join }
+              .getOrElse(
+                fail(s"expected NativeBroadcastJoinExec in executed plan, but got:\n$plan"))
+            assert(nativeBhj.condition.nonEmpty)
+            assert(nativeBhj.broadcastSide == expectedBuildSide)
+        }
+      }
+    }
+  }
+
+  test("native broadcast hash join rejects non-inner residual condition") {
+    withSQLConf("spark.sql.adaptive.enabled" -> "false") {
+      withTable("bhj_left", "bhj_right") {
+        sql("""
+              |CREATE TABLE bhj_left USING parquet AS
+              |SELECT * FROM VALUES
+              |  (1, 1),
+              |  (1, 5),
+              |  (2, null),
+              |  (3, 7)
+              |AS t(id, lv)
+              |""".stripMargin)
+
+        sql("""
+              |CREATE TABLE bhj_right USING parquet AS
+              |SELECT * FROM VALUES
+              |  (1, 2),
+              |  (1, 4),
+              |  (2, 3),
+              |  (3, 8)
+              |AS t(id, rv)
+              |""".stripMargin)
+
+        val df = checkSparkAnswer("""
+              |SELECT /*+ BROADCAST(r) */ l.id
+              |FROM bhj_left l
+              |LEFT JOIN bhj_right r
+              |  ON l.id = r.id AND l.lv < r.rv
+              |ORDER BY l.id
+              |""".stripMargin)
+
+        val plan = stripAQEPlan(df.queryExecution.executedPlan)
+        assert(
+          plan.collectFirst { case _: NativeBroadcastJoinExec => true }.isEmpty,
+          s"expected non-inner residual broadcast hash join to fall back, but got:\n$plan")
+      }
+    }
+  }
+
   test("left join with NOT IN subquery should filter NULL values") {
     // This test verifies the fix for the NULL handling issue in Anti join.
     withSQLConf("spark.sql.autoBroadcastJoinThreshold" -> "-1") {
@@ -970,6 +1055,14 @@ class AuronQuerySuite extends AuronQueryTest with BaseAuronSQLSuite with AuronSQ
 
       // FILTER on SUM with GROUP BY: electronics=400, clothing=500
       checkSparkAnswerAndOperator("""SELECT category, SUM(amount) FILTER (WHERE is_vip = true)
+        |FROM t_filter_agg_2289
+        |GROUP BY category
+        |ORDER BY category""".stripMargin)
+
+      // A group with no matching rows keeps the aggregate's empty-input state.
+      checkSparkAnswerAndOperator("""SELECT category,
+        |  SUM(amount) FILTER (WHERE amount > 450) AS high_amount,
+        |  SUM(amount) FILTER (WHERE amount < 150) AS low_amount
         |FROM t_filter_agg_2289
         |GROUP BY category
         |ORDER BY category""".stripMargin)

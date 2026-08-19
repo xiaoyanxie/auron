@@ -22,12 +22,12 @@ import scala.collection.JavaConverters._
 import scala.util.control.NonFatal
 
 import org.apache.commons.lang3.reflect.MethodUtils
-import org.apache.iceberg.{AddedRowsScanTask, ChangelogOperation, ChangelogScanTask, FileFormat, FileScanTask, MetadataColumns, ScanTask}
+import org.apache.iceberg.{AddedRowsScanTask, ChangelogOperation, ChangelogScanTask, DataFile, DeletedDataFileScanTask, FileFormat, FileScanTask, MetadataColumns, ScanTask}
 import org.apache.iceberg.expressions.{And => IcebergAnd, BoundPredicate, Expression => IcebergExpression, Not => IcebergNot, Or => IcebergOr, UnboundPredicate}
 import org.apache.iceberg.spark.source.AuronIcebergSourceUtil
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.auron.{NativeConverters, Shims}
-import org.apache.spark.sql.catalyst.expressions.{And => SparkAnd, AttributeReference, EqualTo, Expression => SparkExpression, GreaterThan, GreaterThanOrEqual, In, IsNaN, IsNotNull, IsNull, LessThan, LessThanOrEqual, Literal, Not => SparkNot, Or => SparkOr, StartsWith}
+import org.apache.spark.sql.catalyst.expressions.{And => SparkAnd, AttributeReference, EqualTo, Expression => SparkExpression, GreaterThan, GreaterThanOrEqual, In, InSet, IsNaN, IsNotNull, IsNull, LessThan, LessThanOrEqual, Literal, Not => SparkNot, Or => SparkOr, StartsWith}
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.connector.read.{InputPartition, Scan}
 import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
@@ -60,6 +60,8 @@ object IcebergScanSupport extends Logging {
     "auron.iceberg.scan.plan")
   private val runtimeFilteredScanPlanTag: TreeNodeTag[Option[IcebergScanPlan]] = TreeNodeTag(
     "auron.iceberg.runtime.filtered.scan.plan")
+  private val changelogTaskFilterTag: TreeNodeTag[SparkExpression] = TreeNodeTag(
+    "auron.iceberg.changelog.task.filter")
 
   private val SparkChangelogScanClassName =
     "org.apache.iceberg.spark.source.SparkChangelogScan"
@@ -72,6 +74,34 @@ object IcebergScanSupport extends Logging {
   def isIcebergScan(scan: Scan): Boolean =
     scan.getClass.getName == SparkChangelogScanClassName ||
       AuronIcebergSourceUtil.getClassOfSparkBatchQueryScan.isInstance(scan)
+
+  def addChangelogTaskFilter(exec: BatchScanExec, condition: SparkExpression): Unit = {
+    val combined = exec.getTagValue(changelogTaskFilterTag) match {
+      case Some(existing) => SparkAnd(existing, condition)
+      case None => condition
+    }
+    exec.setTagValue(changelogTaskFilterTag, combined)
+  }
+
+  def isSupportedChangelogTaskFilter(expression: SparkExpression): Boolean = {
+    expression match {
+      case SparkAnd(left, right) =>
+        isSupportedChangelogTaskFilter(left) && isSupportedChangelogTaskFilter(right)
+      case EqualTo(attribute: AttributeReference, _: Literal) =>
+        ChangelogMetadataColumnNames.contains(attribute.name)
+      case EqualTo(_: Literal, attribute: AttributeReference) =>
+        ChangelogMetadataColumnNames.contains(attribute.name)
+      case In(attribute: AttributeReference, values) =>
+        ChangelogMetadataColumnNames.contains(attribute.name) &&
+        values.forall(_.isInstanceOf[Literal])
+      case InSet(attribute: AttributeReference, _) =>
+        ChangelogMetadataColumnNames.contains(attribute.name)
+      case IsNotNull(attribute: AttributeReference) =>
+        ChangelogMetadataColumnNames.contains(attribute.name)
+      case _ =>
+        false
+    }
+  }
 
   def fallbackReason(exec: BatchScanExec): Option[String] = {
     val scan = exec.scan
@@ -118,7 +148,11 @@ object IcebergScanSupport extends Logging {
     if (exec.runtimeFilters == runtimeFilters) {
       exec
     } else {
-      Shims.get.copyBatchScanExecWithRuntimeFilters(exec, runtimeFilters)
+      val copied = Shims.get.copyBatchScanExecWithRuntimeFilters(exec, runtimeFilters)
+      exec
+        .getTagValue(changelogTaskFilterTag)
+        .foreach(copied.setTagValue(changelogTaskFilterTag, _))
+      copied
     }
   }
 
@@ -267,22 +301,14 @@ object IcebergScanSupport extends Logging {
       return None
     }
 
-    val addedRowsTasks = changelogTasks.collect { case task: AddedRowsScanTask => task }
-    // First native changelog support is insert-only. Delete and update images need Iceberg
-    // delete-file handling, so keep them on Spark's reader for now.
-    if (addedRowsTasks.size != changelogTasks.size) {
+    // Native changelog scan can read data-file rows directly for insert tasks and
+    // full-data-file delete tasks. Row-level deletes still need Iceberg delete-file handling.
+    val nativeChangelogTasks = changelogTasks.flatMap(toNativeChangelogDataFileTask)
+    if (nativeChangelogTasks.size != changelogTasks.size) {
       return None
     }
 
-    if (!addedRowsTasks.forall(_.operation() == ChangelogOperation.INSERT)) {
-      return None
-    }
-
-    if (!addedRowsTasks.forall(task => deletesEmpty(task.deletes()))) {
-      return None
-    }
-
-    val formats = addedRowsTasks.map(_.file().format()).distinct
+    val formats = nativeChangelogTasks.map(_.file.format()).distinct
     if (formats.size > 1) {
       return None
     }
@@ -298,7 +324,10 @@ object IcebergScanSupport extends Logging {
     }
 
     val pruningPredicates = collectPruningPredicates(scan.asInstanceOf[AnyRef], readSchema)
-    val nativeTasks = addedRowsTasks.map(task => toNativeScanTask(task, partitionSchema))
+    val filteredTasks = exec
+      .getTagValue(changelogTaskFilterTag)
+      .fold(nativeChangelogTasks)(filterChangelogTasks(nativeChangelogTasks, _, partitionSchema))
+    val nativeTasks = filteredTasks.map(task => toNativeScanTask(task, partitionSchema))
     Some(
       IcebergScanPlan(
         nativeTasks,
@@ -528,6 +557,12 @@ object IcebergScanSupport extends Logging {
 
   private case class IcebergPartitionView(tasks: Seq[ScanTask])
 
+  private case class NativeChangelogDataFileTask(
+      file: DataFile,
+      start: Long,
+      length: Long,
+      changelogTask: ChangelogScanTask)
+
   private def icebergPartition(partition: InputPartition): Option[IcebergPartitionView] = {
     val className = partition.getClass.getName
     // Only accept Iceberg SparkInputPartition to access task groups.
@@ -559,6 +594,96 @@ object IcebergScanSupport extends Logging {
     }
   }
 
+  private def toNativeChangelogDataFileTask(
+      task: ChangelogScanTask): Option[NativeChangelogDataFileTask] = {
+    task match {
+      case added: AddedRowsScanTask
+          if added.operation() == ChangelogOperation.INSERT &&
+            deletesEmpty(added.deletes()) =>
+        Some(NativeChangelogDataFileTask(added.file(), added.start(), added.length(), added))
+      case deleted: DeletedDataFileScanTask if deletesEmpty(deleted.existingDeletes()) =>
+        Some(
+          NativeChangelogDataFileTask(deleted.file(), deleted.start(), deleted.length(), deleted))
+      case _ =>
+        None
+    }
+  }
+
+  private type ChangelogMetadataPredicate = Seq[Any] => Boolean
+
+  private def filterChangelogTasks(
+      tasks: Seq[NativeChangelogDataFileTask],
+      condition: SparkExpression,
+      partitionSchema: StructType): Seq[NativeChangelogDataFileTask] = {
+    changelogTaskPredicate(condition, partitionSchema)
+      .map(predicate =>
+        tasks.filter { task =>
+          task.changelogTask match {
+            case _: AddedRowsScanTask =>
+              val values = metadataPartitionValues(
+                task.file.location(),
+                task.file.specId(),
+                Some(task.changelogTask),
+                partitionSchema)
+              predicate(values)
+            case _ =>
+              true
+          }
+        })
+      .getOrElse(tasks)
+  }
+
+  private def changelogTaskPredicate(
+      expression: SparkExpression,
+      partitionSchema: StructType): Option[ChangelogMetadataPredicate] = {
+    expression match {
+      case SparkAnd(left, right) =>
+        for {
+          leftPredicate <- changelogTaskPredicate(left, partitionSchema)
+          rightPredicate <- changelogTaskPredicate(right, partitionSchema)
+        } yield task => leftPredicate(task) && rightPredicate(task)
+      case EqualTo(attribute: AttributeReference, literal: Literal) =>
+        changelogMetadataPredicate(attribute.name, Seq(literal.value), partitionSchema)
+      case EqualTo(literal: Literal, attribute: AttributeReference) =>
+        changelogMetadataPredicate(attribute.name, Seq(literal.value), partitionSchema)
+      case In(attribute: AttributeReference, values) if values.forall(_.isInstanceOf[Literal]) =>
+        changelogMetadataPredicate(
+          attribute.name,
+          values.map(_.asInstanceOf[Literal].value),
+          partitionSchema)
+      case InSet(attribute: AttributeReference, values) =>
+        changelogMetadataPredicate(attribute.name, values.toSeq, partitionSchema)
+      case IsNotNull(attribute: AttributeReference)
+          if ChangelogMetadataColumnNames.contains(attribute.name) &&
+            partitionSchema.fieldNames.contains(attribute.name) =>
+        Some(_ => true)
+      case _ =>
+        None
+    }
+  }
+
+  private def changelogMetadataPredicate(
+      columnName: String,
+      values: Seq[Any],
+      partitionSchema: StructType): Option[ChangelogMetadataPredicate] = {
+    if (!ChangelogMetadataColumnNames.contains(columnName)) {
+      return None
+    }
+
+    val index = partitionSchema.fieldNames.indexOf(columnName)
+    if (index < 0) {
+      None
+    } else {
+      val normalizedValues = values.map(normalizeChangelogMetadataValue)
+      Some(taskValues => normalizedValues.contains(taskValues(index)))
+    }
+  }
+
+  private def normalizeChangelogMetadataValue(value: Any): Any = value match {
+    case text: org.apache.spark.unsafe.types.UTF8String => text.toString
+    case other => other
+  }
+
   private def toNativeScanTask(
       task: FileScanTask,
       partitionSchema: StructType): IcebergNativeScanTask = {
@@ -572,15 +697,18 @@ object IcebergScanSupport extends Logging {
   }
 
   private def toNativeScanTask(
-      task: AddedRowsScanTask,
+      task: NativeChangelogDataFileTask,
       partitionSchema: StructType): IcebergNativeScanTask = {
-    val file = task.file()
     IcebergNativeScanTask(
-      file.location(),
-      task.start(),
-      task.length(),
-      file.fileSizeInBytes(),
-      metadataPartitionValues(file.location(), file.specId(), Some(task), partitionSchema))
+      task.file.location(),
+      task.start,
+      task.length,
+      task.file.fileSizeInBytes(),
+      metadataPartitionValues(
+        task.file.location(),
+        task.file.specId(),
+        Some(task.changelogTask),
+        partitionSchema))
   }
 
   private def metadataPartitionValues(

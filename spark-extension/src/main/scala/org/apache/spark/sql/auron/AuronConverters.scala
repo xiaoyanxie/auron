@@ -545,6 +545,9 @@ object AuronConverters extends Logging {
       addRenameColumnsExec(convertToNative(exec.child)))
   }
 
+  def prepareExtensionPlans(exec: SparkPlan): Unit =
+    extConvertProviders.foreach(_.prepare(exec))
+
   def convertSortExec(exec: SortExec): SparkPlan = {
     val (sortOrder, global, child) = (exec.sortOrder, exec.global, exec.child)
     logDebugPlanConversion(
@@ -739,7 +742,7 @@ object AuronConverters extends Logging {
           "joinType" -> joinType,
           "condition" -> condition,
           "buildSide" -> buildSide))
-      assert(condition.isEmpty, "join condition is not supported")
+      validateNativeInnerJoinCondition(joinType, condition)
 
       // verify build side is native
       buildSide match {
@@ -756,6 +759,7 @@ object AuronConverters extends Logging {
         leftKeys,
         rightKeys,
         joinType,
+        condition,
         buildSide,
         naaj)
 
@@ -797,6 +801,7 @@ object AuronConverters extends Logging {
         Nil,
         Nil,
         joinType,
+        None,
         buildSide,
         isNullAwareAntiJoin = false)
     } catch {

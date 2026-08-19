@@ -18,11 +18,13 @@ package org.apache.auron.flink.table.runtime;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.time.ZoneId;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 import org.apache.auron.flink.table.AuronFlinkTableTestBase;
+import org.apache.auron.flink.table.planner.UnsupportedFlinkNodeRecorder;
 import org.apache.flink.types.Row;
 import org.apache.flink.util.CollectionUtil;
 import org.junit.jupiter.api.Test;
@@ -219,6 +221,77 @@ public class AuronFlinkCalcITCase extends AuronFlinkTableTestBase {
                 .collect());
         rows.sort(Comparator.comparingInt(o -> (int) o.getField(0)));
         assertThat(rows).isEqualTo(Arrays.asList(Row.of(1), Row.of(2)));
+    }
+
+    /** UNIX_TIMESTAMP over the per-row {@code ts} string converts to the native ext function and
+     * yields the epoch seconds. The session timezone is set to Asia/Shanghai to make the result
+     * deterministic and to exercise timezone propagation into the native plan. */
+    @Test
+    public void testUnixTimestamp() {
+        tableEnvironment.getConfig().setLocalTimeZone(ZoneId.of("Asia/Shanghai"));
+        List<Row> rows = CollectionUtil.iteratorToList(tableEnvironment
+                .executeSql("select UNIX_TIMESTAMP(`ts`) from T1")
+                .collect());
+        rows.sort(Comparator.comparingLong(o -> (long) o.getField(0)));
+        assertThat(rows).isEqualTo(Arrays.asList(Row.of(1602259201L), Row.of(1602259202L), Row.of(1602259203L)));
+    }
+
+    /** UNIX_TIMESTAMP yields the epoch seconds at zero offset when the session timezone is named
+     * without a region prefix. */
+    @Test
+    public void testUnixTimestampUtcTimeZone() {
+        tableEnvironment.getConfig().setLocalTimeZone(ZoneId.of("UTC"));
+        List<Row> rows = CollectionUtil.iteratorToList(tableEnvironment
+                .executeSql("select UNIX_TIMESTAMP(`ts`) from T1")
+                .collect());
+        rows.sort(Comparator.comparingLong(o -> (long) o.getField(0)));
+        assertThat(rows).isEqualTo(Arrays.asList(Row.of(1602288001L), Row.of(1602288002L), Row.of(1602288003L)));
+    }
+
+    /** UNIX_TIMESTAMP yields the epoch seconds for the offset when the session timezone is a
+     * fixed-offset construction, a form Flink accepts that has no native equivalent. */
+    @Test
+    public void testUnixTimestampFixedOffsetTimeZoneFallsBack() {
+        tableEnvironment.getConfig().setLocalTimeZone(ZoneId.of("GMT-08:00"));
+        List<Row> rows = CollectionUtil.iteratorToList(tableEnvironment
+                .executeSql("select UNIX_TIMESTAMP(`ts`) from T1")
+                .collect());
+        rows.sort(Comparator.comparingLong(o -> (long) o.getField(0)));
+        assertThat(rows).isEqualTo(Arrays.asList(Row.of(1602316801L), Row.of(1602316802L), Row.of(1602316803L)));
+    }
+
+    /**
+     * The zero-argument UNIX_TIMESTAMP reads the wall clock rather than parsing a column. It yields
+     * one row per input row, each carrying epoch seconds bracketed by the test's own clock reads.
+     *
+     * <p>Fallback to Flink's codegen Calc is silent and total, and produces an identical row set, so
+     * the values alone cannot show the Calc ran natively. The fallback counter narrows it: a Calc
+     * that fails to convert always records either an unsupported node or a composition failure
+     * before it falls back, so a count of zero means this Calc converted. It does not mean the Calc
+     * ran. A native library holding no registry arm for the function still converts at plan time
+     * and only fails once executing, where nothing records a fallback, leaving the counter at zero
+     * and the result set empty.
+     *
+     * <p>The row count is what establishes that the native plan executed. {@code allSatisfy} passes
+     * vacuously over an empty list, so dropping {@code hasSize(3)} would let that runtime failure
+     * read as success and leave native execution unverified.
+     */
+    @Test
+    public void testUnixTimestampZeroArgRunsNatively() {
+        UnsupportedFlinkNodeRecorder.resetForTest();
+        long before = System.currentTimeMillis() / 1000;
+        List<Row> rows = CollectionUtil.iteratorToList(
+                tableEnvironment.executeSql("select UNIX_TIMESTAMP() from T1").collect());
+        long after = System.currentTimeMillis() / 1000;
+
+        assertThat(UnsupportedFlinkNodeRecorder.peekEmitCount())
+                .as("a non-zero fallback count means the Calc did not run natively")
+                .isZero();
+        assertThat(rows)
+                .as("one clock-bracketed row per input row; an empty result set means the native"
+                        + " library implements no arm for this function")
+                .hasSize(3)
+                .allSatisfy(row -> assertThat((long) row.getField(0)).isBetween(before, after));
     }
 
     /** A NOT LIKE filter keeps rows whose string does not match the pattern. */
